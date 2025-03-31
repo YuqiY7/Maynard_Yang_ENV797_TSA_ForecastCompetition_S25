@@ -1,0 +1,115 @@
+---
+title: "Forecast_Model_1"
+author: "Yuqi Yang"
+date: "2025-03-31"
+output: pdf_document
+always_allow_html: true
+editor_options: 
+  chunk_output_type: inline
+  markdown: 
+    wrap: sentence
+---
+
+## Setting R code chunk options
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,tidy.opts=list(width.cutoff=80), tidy=FALSE) 
+```
+
+## Loading packages and initializing
+
+```{r package, message=FALSE, warning=FALSE}
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(forecast)
+library(openxlsx)
+```
+
+## Import and transform load data
+
+```{r}
+#Import hourly load data
+load_data <- read_excel("data/load.xlsx")
+
+#Convert to daily average load
+load_daily <- load_data %>%
+  mutate(DailyLoad = rowMeans(select(., h1:h24), na.rm = TRUE)) %>%
+  select(date, DailyLoad)
+
+summary(load_daily)
+
+#Transforming into time series objects
+load_daily_ts <- msts(load_daily$DailyLoad,
+                start = c(2005, 1, 1),
+                seasonal.periods = c(7, 365.25))
+
+#Plot the time series
+autoplot(load_daily_ts) +
+  labs(title = "Daily Electricity Load Time Series")
+
+#Decompose daily load time series
+load_daily_ts %>% mstl() %>%
+  autoplot()
+
+```
+
+## Prepare training and test sets
+
+```{r}
+#Create a subset for training purpose from 2005-01-01 to 2009-12-31
+n_for = 59
+
+load_daily_train_ts <- subset(load_daily_ts, end = length(load_daily_ts) - n_for)
+
+#Create a subset for testing purpose from 2010-01-01 to 2010-02-28
+load_daily_test_ts   <- subset(load_daily_ts, start = length(load_daily_ts) - n_for + 1)
+
+#Plot training and testing sets
+autoplot(load_daily_train_ts)
+autoplot(load_daily_test_ts)
+```
+
+## Model 1 - Naive
+
+```{r}
+#Fit naive model to training data
+naive_model <- naive(load_daily_train_ts, h = n_for)
+
+#Plot forecast vs actual
+autoplot(naive_model) +
+  autolayer(load_daily_test_ts, series = "Actual", color = "red") +
+  labs(title = "Naive Forecast vs Actual 2010 Jan–Feb",
+       y = "Daily Load")
+
+#Refit model on full dataset
+naive_model_full <- naive(load_daily_ts, h = n_for)
+str(naive_model_full)
+
+#Extract forecast values
+forecast_2011_model_1 <- as.numeric(naive_model_full$mean)
+
+```
+
+## Create submission file
+
+```{r}
+#Read submission template
+template <- read_excel("data/submission_template.xlsx")
+
+#Insert forecast
+template$load <- forecast_2011_model_1
+
+#Save as CSV
+write.csv(template, "forecast_submission_model_1.csv", row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
