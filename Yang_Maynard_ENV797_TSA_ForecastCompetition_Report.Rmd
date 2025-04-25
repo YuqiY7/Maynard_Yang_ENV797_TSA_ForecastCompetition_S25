@@ -1,0 +1,239 @@
+---
+title: "Yang Maynard ENV797 TSA Forecast Competition Report"
+author: "Yuqi Yang and Justin Maynard"
+date: "2025-04-25"
+output: html_document
+---
+
+
+
+## Loading packages and initializing
+
+```{r package, message=FALSE, warning=FALSE, include= FALSE}
+library(readxl)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(forecast)
+library(openxlsx)
+library(here)
+library(tseries)
+theme_set(theme_classic())
+
+```
+
+## Exploring Data
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#Import hourly load data
+load_data <- read_excel("data/load.xlsx")
+
+#Convert to daily average load
+load_daily <- load_data %>%
+  mutate(DailyLoad = rowMeans(select(., h1:h24), na.rm = TRUE)) %>%
+  select(date, DailyLoad)
+
+summary(load_daily)
+
+#Transforming into time series objects
+load_daily_ts <- msts(load_daily$DailyLoad,
+                start = c(2005, 1, 1),
+                seasonal.periods = c(7, 365.25))
+
+
+```
+
+```{r echo=TRUE, fig.height=3, fig.width=5}
+
+#Plot the time series
+autoplot(load_daily_ts) +
+  labs(title = "Daily Electricity Load Time Series")
+```
+```{r echo=TRUE, fig.height=3, fig.width=5}
+
+#Decompose daily load time series
+load_daily_ts %>% mstl() %>%
+  autoplot()
+```
+
+
+## Prepare training and test sets
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#Create a subset for training purpose from 2005-01-01 to 2009-12-31
+n_for = 59
+
+train_end <- c(2009, 365)
+test_start <- c(2010,1)
+test_end <- c(2010,59)
+
+load_daily_train_ts <- window(load_daily_ts, end = train_end)
+load_daily_test_ts   <- window(load_daily_ts, start = test_start, end = test_end)
+
+load_daily_full_ts <- window(load_daily_ts, end = c(2010, 365))
+
+
+#Plot training and testing sets
+#autoplot(load_daily_train_ts)
+#autoplot(load_daily_test_ts)
+```
+
+
+
+## Model 1 - STL + ETS
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+ETS_fit <- stlf(load_daily_train_ts, h = n_for)
+
+#autoplot(ETS_fit) + ylab("Daily Demand")
+
+#fit on full dataset
+ETS_full <- stlf(load_daily_ts, h = n_for)
+str(ETS_full)
+
+#accuracy
+ETS_scores <- accuracy(ETS_fit$mean, load_daily_test_ts)
+```
+
+```{r echo = FALSE}
+#plot with full data
+autoplot(load_daily_train_ts) + 
+  autolayer(load_daily_test_ts, series = "Observed") +
+  autolayer(ETS_fit, series = "STL + ETS", PI = FALSE) +
+  ylab("Demand")
+```
+
+
+## Model 2 - ARIMA + FOURIER terms
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+k = c(2,6)
+
+ARIMA_Fourier_Fit <- auto.arima(load_daily_train_ts,
+                                seasonal = FALSE,
+                                lambda = 0,
+                                xreg = fourier(load_daily_train_ts,
+                                               K = k))
+
+ARIMA_Fourier_Forecast <- forecast(ARIMA_Fourier_Fit,
+                                   xreg = fourier(load_daily_train_ts,
+                                                  K = k,
+                                                  h = n_for),
+                                   h = n_for)
+
+#autoplot(ARIMA_Fourier_Forecast) 
+
+
+ARIMA_Fourier_scores <- accuracy(ARIMA_Fourier_Forecast$mean, load_daily_test_ts)
+
+```
+
+
+```{r echo=FALSE, fig.height=3, fig.width=5}
+autoplot(load_daily_train_ts) + 
+  autolayer(load_daily_test_ts, series = "Observed") +
+  autolayer(ARIMA_Fourier_Forecast, series = "ARIMA_FOURIER", PI = FALSE) + 
+  ylab("Demand")
+```
+
+
+## Model 3 - TBATS
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+#Fit on training data
+TBATS_fit <- tbats(load_daily_train_ts)
+
+TBATS_forecast <- forecast(TBATS_fit, h = n_for)
+
+
+TBATS_scores <- accuracy(TBATS_forecast$mean, load_daily_test_ts)
+
+
+#Fit on full data
+#TBATS_full <- tbats(load_daily_ts)
+#TBATS_forecast_full <- forecast(TBATS_full, h = n_for)
+
+
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=5}
+autoplot(load_daily_train_ts) + 
+  autolayer(load_daily_test_ts, series = "Observed") +
+  autolayer(TBATS_forecast, series = "TBATS", PI = FALSE)+ 
+  ylab("Demand")
+```
+
+
+
+## Model 4 - BSM
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#variances for level, trend, seasonal, observation
+
+BSM_fit <- StructTS(load_daily_train_ts, type = "BSM")
+
+#checkresiduals(BSM_fit)
+
+BSM_forecast <- forecast(BSM_fit, h = n_for)
+#autoplot(BSM_forecast) 
+
+BSM_scores <- accuracy(BSM_forecast$mean, load_daily_test_ts)
+
+```
+
+```{r echo=FALSE, fig.height=3, fig.width=5}
+autoplot(load_daily_train_ts) + 
+  autolayer(load_daily_test_ts, series = "Observed") +
+  autolayer(BSM_forecast, series = "BSM", PI = FALSE)+ 
+  ylab("Demand")
+```
+
+
+## Model 5 - NNETAR
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#Fit on full data
+NN_fit <- nnetar(load_daily_train_ts,
+                 p = 1,
+                 P = 0,
+                 xreg = fourier(load_daily_train_ts, K=c(3,15)))
+
+NN_forecast <- forecast(NN_fit_full, h = n_for, 
+                 xreg = fourier(load_daily_train_ts, 
+                                K = c(3,15),
+                                h = n_for))
+
+NNETAR_scores <- accuracy(NN_fit$mean, load_daily_test_ts)
+
+```
+
+
+```{r echo=FALSE, fig.height=3, fig.width=5}
+autoplot(load_daily_train_ts) + 
+  autolayer(load_daily_test_ts, series = "Observed") +
+  autolayer(NN_forecast_full, series = "BSM", PI = FALSE)+ 
+  ylab("Demand")
+```
+
+
+```{r echo = TRUE}
+scores <- as.data.frame(rbind(ETS_scores, ARIMA_Fourier_scores, TBATS_scores, BSM_scores, NNETAR_scores  )
+row.names(scores) <- c("ETS", "ARIMA Fourier","TBATS", "BSM", "ETS(AAN)", "NNETAR")
+
+#choose model with lowest RMSE
+best_model_index <- which.min(soy_scores[,"RMSE"])
+cat("The best model by RMSE is:", row.names(soy_scores[best_model_index,]))       
+
+scores <- kbl(soy_scores, 
+      caption = "Forecast Accuracy for Soybean Models",
+      digits = array(5,ncol(soy_scores))) %>%
+  kable_styling(full_width = FALSE, position = "center") %>%
+  #highlight model with lowest RMSE
+  kable_styling(latex_options="striped", stripe_index = which.min(soy_scores[,"RMSE"]))
+scores
+```
+
