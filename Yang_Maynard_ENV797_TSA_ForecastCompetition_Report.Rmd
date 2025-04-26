@@ -2,9 +2,10 @@
 title: "Yang Maynard ENV797 TSA Forecast Competition Report"
 author: "Yuqi Yang and Justin Maynard"
 date: "2025-04-25"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
-
 
 
 ## Loading packages and initializing
@@ -18,222 +19,379 @@ library(forecast)
 library(openxlsx)
 library(here)
 library(tseries)
+library(future)
 theme_set(theme_classic())
-
 ```
 
-## Exploring Data
+---
+
+## 1. Data preparation and exploration
 
 ```{r message=FALSE, warning=FALSE, include=FALSE}
-#Import hourly load data
+# Import hourly load data
 load_data <- read_excel("data/load.xlsx")
 
-#Convert to daily average load
-load_daily <- load_data %>%
+# Convert to daily average load
+daily_load <- load_data %>%
   mutate(DailyLoad = rowMeans(select(., h1:h24), na.rm = TRUE)) %>%
   select(date, DailyLoad)
 
-summary(load_daily)
+# Transform into multiple‑seasonal time–series object
+load_ts <- msts(
+  daily_load$DailyLoad,
+  start = c(2005, 1, 1),
+  seasonal.periods = c(7, 365.25)
+)
+```
 
-#Transforming into time series objects
-load_daily_ts <- msts(load_daily$DailyLoad,
+```{r fig.height=3, fig.width=6, echo=FALSE}
+# Visualise raw series and STL decomposition
+p1 <- autoplot(load_ts) + labs(title = "Daily electricity load (2005‑2010)")
+p2 <- mstl(load_ts) %>% autoplot() + labs(title = "STL decomposition of load")
+print(p1)
+print(p2)
+```
+
+---
+
+## 2. Train/test split
+
+```{r train-test, include=FALSE}
+# Hold‑out period: Jan 1 2010 –Feb 28 2010 (59 obs.)
+n_for <- 59
+train_end  <- c(2009, 365)
+test_start <- c(2010, 1)
+test_end   <- c(2010, n_for)
+
+train_ts <- window(load_ts, end   = train_end)
+test_ts  <- window(load_ts, start = test_start, end = test_end)
+```
+
+We split our data such that the training data ranged from January 1, 2025 to December 31, 2009, and the testing data ranged from January 1, 2010 to Feburary 28, 2010. We used the entire dataset from January 1, 2005 to December 31, 2010 to make projections until Feburary 28, 2011. 
+
+## 3. Forecasting models
+For each candidate model we briefly describe the underlying methodology, present the forecast on the hold‑out sample, and inspect the residuals to ensure that no structure remains unexplained.  Ideally residuals should behave like white noise: zero‑mean, constant variance, no autocorrelation, and approximate normality.
+
+### 3.1 STL + ETS
+STL (Seasonal–Trend decomposition using Loess) removes multiple seasonalities.  The deseasonalised remainder is forecast with an ETS(A,A,N) state‑space model.  Seasonality is then re‑added to obtain the final forecast.  The combination is robust to complex, non‑stationary seasonality.
+
+```{r stl, include=FALSE, message=FALSE, warning=FALSE}
+fit_ets <- stlf(train_ts, h = n_for)
+acc_ets <- accuracy(fit_ets$mean, test_ts)
+```
+
+```{r plot_stl, echo=FALSE, fig.height=3, fig.width=6}
+autoplot(train_ts) +
+  autolayer(test_ts, series = "Observed") +
+  autolayer(fit_ets,  series = "STL + ETS", PI = FALSE) +
+  labs(title = "STL + ETS forecast", y = "Load")
+```
+
+```{r stl_residuals, echo=FALSE, fig.height=3, fig.width=6, message=FALSE, warning=FALSE}
+checkresiduals(fit_ets)
+```
+
+### 3.2 ARIMA with Fourier terms
+Next, auto.arima() is used on the deseasonalised series augmented with pairs of Fourier terms (K=2,6) that capture the weekly and annual seasonality without differencing the series. These terms were determined by testing auta.arima() on the training data to see what yielded the best result.
+
+```{r arima, message=FALSE, warning=FALSE,  include=FALSE, cache=TRUE}
+K <- c(2, 6)
+fit_arima <- auto.arima(
+  train_ts, seasonal = FALSE, lambda = 0,
+  xreg = fourier(train_ts, K = K)
+)
+fc_arima <- forecast(
+  fit_arima, h = n_for,
+  xreg = fourier(train_ts, K = K, h = n_for)
+)
+acc_arima <- accuracy(fc_arima$mean, test_ts)
+```
+
+```{r arima_plot, echo=FALSE, fig.height=3, fig.width=6}
+autoplot(train_ts) +
+  autolayer(test_ts,  series = "Observed") +
+  autolayer(fc_arima, series = "ARIMA + Fourier", PI = FALSE) +
+  labs(title = "ARIMA + Fourier forecast", y = "Load")
+```
+
+```{r arima_residuals, echo=FALSE, fig.height=3, fig.width=6, message=FALSE, warning=FALSE}
+checkresiduals(fc_arima)
+```
+
+### 3.3 TBATS
+TBATS (Trigonometric seasonality, Box‑Cox transform, ARMA errors, Trend and Seasonal components) handles multiple seasons and complex seasonal patterns (e.g. non‑integer periods).  It is especially suitable for data with weekly and annual seasonality. Due to computational constraints (knitting taking upwards of 45 minutes) we could not include TBATS in the final report.
+
+```{r tbats, message=FALSE, warning=FALSE,  include=FALSE, cache=TRUE}
+#fit_tbats <- bats(train_ts)
+#fc_tbats <- forecast(fit_tbats, h = n_for)
+#acc_tbats <- accuracy(fc_tbats$mean, test_ts)
+```
+
+```{r tbats_plot, echo=FALSE, fig.height=3, fig.width=6}
+#autoplot(train_ts) +
+#  autolayer(test_ts,  series = "Observed") +
+#  autolayer(fc_tbats, series = "TBATS", PI = FALSE) +
+#  labs(title = "TBATS forecast", y = "Load")
+```
+
+```{r tbats_residuals, echo=FALSE, fig.height=3, fig.width=6}
+#checkresiduals(fc_tbats)
+```
+
+### 3.4 Scenario Generation (temperature & humidity‑driven simulations)
+Historical load is strongly influenced by weather. We therefore generate weather‑driven load scenarios and convert them into probabilistic forecasts:
+
+1. Weather data. Daily mean temperature (t_ws1) and relative humidity (rh_ws1) are aggregated from weather‑station readings and joined to the load data.
+2. Univariate forecasting. For each variable (load, temperature, humidity) a non‑seasonal SARIMA with Fourier regressors is fitted and used to simulate n = 10 future paths.
+3. Cross‑correlation. Because the independently simulated series are uncorrelated, we impose the historical correlation structure via Cholesky decomposition.
+4. Evaluation. Scenarios are summarised into a fan‑chart forecast.
+
+
+
+```{r scen, message=FALSE, warning=FALSE,  include=FALSE}
+
+temperature <- read_excel("data/temperature.xlsx")
+humidity <- read_excel("data/relative_humidity.xlsx")
+
+temperature_daily <- temperature %>% 
+  group_by(date) %>% 
+  summarise(across(starts_with("t_ws"),
+                   ~ mean(.x, na.rm = TRUE)))
+
+humidity_daily <- humidity %>% 
+  group_by(date) %>% 
+  summarise(across(starts_with("rh_ws"),
+                   ~ mean(.x, na.rm = TRUE)))
+
+data_all <- daily_load %>% 
+  right_join(., temperature_daily) %>% 
+  right_join(., humidity_daily)
+
+
+all_data_ts <- msts((data_all[2:ncol(as.matrix(data_all[ , -1]))]),
                 start = c(2005, 1, 1),
                 seasonal.periods = c(7, 365.25))
+all_data_ts <- all_data_ts[,c("DailyLoad", "t_ws1", "rh_ws1")]
+
+n_for <- 59
+train_end  <- c(2009, 365)
+test_start <- c(2010, 1)
+test_end   <- c(2010, n_for)
+
+scen_train_ts <- window(all_data_ts, end   = train_end)
+scen_test_ts  <- window(all_data_ts, start = test_start, end = test_end)
+
+
+R = cor(scen_train_ts)
+
+horizon <- n_for
+nscen <- 10
+
+X = array(0, c(ncol(scen_train_ts), horizon, nscen))
+
+for(i in 1:ncol(scen_train_ts)){
+    k = c(2,6)
+    fit_SARIMA = auto.arima(scen_train_ts[,i],
+                          seasonal = FALSE,
+                          lambda = 0,
+                          xreg = fourier(scen_train_ts[,i],
+                          K = k))
+  
+    for_SARIMA=forecast(fit_SARIMA,
+                      xreg = fourier(scen_train_ts[,i],
+                      K = k,
+                      h = n_for),
+                      h = n_for)   #forecast using the fitted SARIMA
+  
+    for(t in 1:horizon){
+    # we will use the following expression to manually compute sd
+    sd=(for_SARIMA$upper[t,1] - for_SARIMA$lower[t,1]) / (2 * qnorm(.5 + for_SARIMA$level[1] / 200))
+    
+    # Now that I have mean and standard deviation for time t
+    # I can draw scenarios using the rnorm() function
+    X[i,t,] <- rnorm(nscen,mean=for_SARIMA$mean[t],sd=sd)  
+    
+    #note this is done in a loop for all the 24 steps we are forecasting 
+    #and this loop is inside a loop over all HPP inflows
+    
+    } # end t loop
+
+  # remove models just to make sure we start from scratch for the next HPP
+  # remember we are still inside the HPP loop
+  rm(fit_SARIMA, for_SARIMA) 
+                      
+}
 
 
 ```
 
-```{r echo=TRUE, fig.height=3, fig.width=5}
 
-#Plot the time series
-autoplot(load_daily_ts) +
-  labs(title = "Daily Electricity Load Time Series")
-```
-```{r echo=TRUE, fig.height=3, fig.width=5}
+```{r scen_2, message=FALSE, warning=FALSE,  include=FALSE}
+U <- chol(R) #that will give upper triangular matrix for Cholesky decomposition
+L <- t(U) #to get lower triangular matrix you need to transpose U, that is what the t() function is doing here
 
-#Decompose daily load time series
-load_daily_ts %>% mstl() %>%
-  autoplot()
-```
+#Creating array Y where we will store correlated scenarios
+Y <- array(0,c(ncol(scen_train_ts),horizon,nscen)) 
 
+# Need to use another loop structure to make sure spatial correlation among HPP is present in all scenarios
+for(s in 1:nscen){ 
+  aux <- X[,,s] #creating aux variable simple because X is not a 2x2 matrix, 
+                  #but an array of 3 dimension and we cannot do matrix multiplication with arrays
+  
+  Y[,,s] <- L%*%aux  #recall L is the Cholesky decomposition of our correlation matrix R computed from with historical data
 
-## Prepare training and test sets
-
-```{r message=FALSE, warning=FALSE, include=FALSE}
-#Create a subset for training purpose from 2005-01-01 to 2009-12-31
-n_for = 59
-
-train_end <- c(2009, 365)
-test_start <- c(2010,1)
-test_end <- c(2010,59)
-
-load_daily_train_ts <- window(load_daily_ts, end = train_end)
-load_daily_test_ts   <- window(load_daily_ts, start = test_start, end = test_end)
-
-load_daily_full_ts <- window(load_daily_ts, end = c(2010, 365))
+}#end scenario loop
 
 
-#Plot training and testing sets
-#autoplot(load_daily_train_ts)
-#autoplot(load_daily_test_ts)
+#Calculate correlation again
+aux <- Y[,,1]
+cor(t(aux))
+
+Y
 ```
 
 
 
-## Model 1 - STL + ETS
+```{r scen_3, message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forecast)
 
-```{r message=FALSE, warning=FALSE, include=FALSE}
+# years forecasting
+test_index <- time(scen_test_ts)                # msts keeps the time index
+# make sure length(test_index) == horizon
 
-ETS_fit <- stlf(load_daily_train_ts, h = n_for)
-
-#autoplot(ETS_fit) + ylab("Daily Demand")
-
-#fit on full dataset
-ETS_full <- stlf(load_daily_ts, h = n_for)
-str(ETS_full)
-
-#accuracy
-ETS_scores <- accuracy(ETS_fit$mean, load_daily_test_ts)
-```
-
-```{r echo = FALSE}
-#plot with full data
-autoplot(load_daily_train_ts) + 
-  autolayer(load_daily_test_ts, series = "Observed") +
-  autolayer(ETS_fit, series = "STL + ETS", PI = FALSE) +
-  ylab("Demand")
-```
+scenario_df <-
+  expand_grid(
+    time      = test_index,
+    scenario  = seq_len(nscen)
+  ) %>% 
+  arrange(time, scenario) %>% 
+  mutate(
+    value = as.vector(t(Y[1, , ]))              # 1 = DailyLoad
+  )
 
 
-## Model 2 - ARIMA + FOURIER terms
+fan_df <-
+  scenario_df %>% 
+  group_by(time) %>%
+  summarise(
+    p50 = median(value),
+    p10 = quantile(value, .10),
+    p90 = quantile(value, .90),
+    .groups = "drop"
+  )
 
-```{r message=FALSE, warning=FALSE, include=FALSE}
-
-k = c(2,6)
-
-ARIMA_Fourier_Fit <- auto.arima(load_daily_train_ts,
-                                seasonal = FALSE,
-                                lambda = 0,
-                                xreg = fourier(load_daily_train_ts,
-                                               K = k))
-
-ARIMA_Fourier_Forecast <- forecast(ARIMA_Fourier_Fit,
-                                   xreg = fourier(load_daily_train_ts,
-                                                  K = k,
-                                                  h = n_for),
-                                   h = n_for)
-
-#autoplot(ARIMA_Fourier_Forecast) 
+actual_df <- tibble(
+  time   = test_index,
+  actual = as.numeric(scen_test_ts[, "DailyLoad"])
+)
 
 
-ARIMA_Fourier_scores <- accuracy(ARIMA_Fourier_Forecast$mean, load_daily_test_ts)
+fan_plot <- ggplot() +
+  geom_line(data = scenario_df,
+            aes(time, value, group = scenario),
+            colour = "gray60", alpha = 0.3) +
+  geom_ribbon(data = fan_df,
+              aes(time, ymin = p10, ymax = p90),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(data = fan_df,
+            aes(time, p50),
+            colour = "steelblue", linewidth = 1) +
+  geom_line(data = actual_df,
+            aes(time, actual),
+            colour = "firebrick", linewidth = 1) +
+  geom_point(data = actual_df,
+             aes(time, actual),
+             colour = "firebrick", size = 2) +
+  labs(title    = "Daily System Load: scenarios vs actual",
+       y        = "MW",
+       subtitle = "Gray = each scenario; blue band = 10–90 % range; red = actual") +
+  theme_classic()
 
-```
+fc <- list(
+  model  = "Simulated",
+  level  = c(10, 90),
+  mean   = ts(fan_df$p50,
+              start = start(scen_test_ts),
+              frequency = frequency(scen_test_ts)),
+  lower  = ts(cbind(fan_df$p10, fan_df$p10),
+              start = start(scen_test_ts),
+              frequency = frequency(scen_test_ts)),
+  upper  = ts(cbind(fan_df$p90, fan_df$p90),
+              start = start(scen_test_ts),
+              frequency = frequency(scen_test_ts)),
+  x      = scen_train_ts[, "DailyLoad"],
+  series = "DailyLoad",
+  method = "Cholesky-sim"
+)
 
+autoplot(fc$mean) +
+  autolayer(scen_test_ts[, "DailyLoad"], series = "Actual") +
+  labs(title = "Simulated DailyLoad forecasts vs actuals",
+       y     = "MW")
 
-```{r echo=FALSE, fig.height=3, fig.width=5}
-autoplot(load_daily_train_ts) + 
-  autolayer(load_daily_test_ts, series = "Observed") +
-  autolayer(ARIMA_Fourier_Forecast, series = "ARIMA_FOURIER", PI = FALSE) + 
-  ylab("Demand")
-```
+accuracy(fc$mean, scen_test_ts[, "DailyLoad"])
 
-
-## Model 3 - TBATS
-
-```{r message=FALSE, warning=FALSE, include=FALSE}
-
-#Fit on training data
-TBATS_fit <- tbats(load_daily_train_ts)
-
-TBATS_forecast <- forecast(TBATS_fit, h = n_for)
-
-
-TBATS_scores <- accuracy(TBATS_forecast$mean, load_daily_test_ts)
-
-
-#Fit on full data
-#TBATS_full <- tbats(load_daily_ts)
-#TBATS_forecast_full <- forecast(TBATS_full, h = n_for)
-
-
-```
-
-```{r echo=FALSE, fig.height=3, fig.width=5}
-autoplot(load_daily_train_ts) + 
-  autolayer(load_daily_test_ts, series = "Observed") +
-  autolayer(TBATS_forecast, series = "TBATS", PI = FALSE)+ 
-  ylab("Demand")
-```
-
-
-
-## Model 4 - BSM
-
-```{r message=FALSE, warning=FALSE, include=FALSE}
-#variances for level, trend, seasonal, observation
-
-BSM_fit <- StructTS(load_daily_train_ts, type = "BSM")
-
-#checkresiduals(BSM_fit)
-
-BSM_forecast <- forecast(BSM_fit, h = n_for)
-#autoplot(BSM_forecast) 
-
-BSM_scores <- accuracy(BSM_forecast$mean, load_daily_test_ts)
 
 ```
 
-```{r echo=FALSE, fig.height=3, fig.width=5}
-autoplot(load_daily_train_ts) + 
-  autolayer(load_daily_test_ts, series = "Observed") +
-  autolayer(BSM_forecast, series = "BSM", PI = FALSE)+ 
-  ylab("Demand")
+```{r scen_plot, echo=FALSE, fig.height=3, fig.width=6}
+fan_plot
 ```
 
 
-## Model 5 - NNETAR
+### 3.5 Neural Network Autoregression (NNETAR)
+NNETAR fits a feed‑forward neural network with lagged inputs and optional external regressors (here, Fourier terms with K=3,15). The Fourier terms were determined by iterating over a list of possible terms to see which has the lowest MSPE. It can capture non‑linear relationships beyond traditional linear models.
 
+```{r nn, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+K_nn <- c(3, 15)
+fit_nnet <- nnetar(train_ts, p = 1, P = 0,
+                   xreg = fourier(train_ts, K = K_nn))
+fc_nnet <- forecast(
+  fit_nnet, h = n_for,
+  xreg = fourier(train_ts, K = K_nn, h = n_for)
+)
+acc_nnet <- accuracy(fc_nnet$mean, test_ts)
+```
 
-```{r message=FALSE, warning=FALSE, include=FALSE}
-#Fit on full data
-NN_fit <- nnetar(load_daily_train_ts,
-                 p = 1,
-                 P = 0,
-                 xreg = fourier(load_daily_train_ts, K=c(3,15)))
+```{r nn_plot, echo=FALSE, fig.height=3, fig.width=6}
+autoplot(train_ts) +
+  autolayer(test_ts,  series = "Observed") +
+  autolayer(fc_nnet, series = "NNETAR", PI = FALSE) +
+  labs(title = "NNETAR forecast", y = "Load")
+```
 
-NN_forecast <- forecast(NN_fit_full, h = n_for, 
-                 xreg = fourier(load_daily_train_ts, 
-                                K = c(3,15),
-                                h = n_for))
+```{r nn_residuals, echo=FALSE, fig.height=3, fig.width=6}
+checkresiduals(fc_nnet)
+```
 
-NNETAR_scores <- accuracy(NN_fit$mean, load_daily_test_ts)
+---
 
+## 4. Forecast accuracy comparison
+
+```{r accuracy, echo=FALSE}
+acc_tbl <- rbind(
+  ETS  = acc_ets,
+  "ARIMA + Fourier" = acc_arima,
+  #TBATS = acc_tbats,
+  #BSM   = acc_bsm,
+  NN = acc_nnet,
+  Simulated = acc_sim
+) %>%
+  as.data.frame()
+
+knitr::kable(acc_tbl[, c("ME", "RMSE", "MAE", "MAPE")], digits = 2,
+             caption = "Hold‑out accuracy (Jan 1 – Feb 28 2010)")
+
+best <- rownames(acc_tbl)[which.min(acc_tbl$RMSE)]
+cat("\n**Best model by RMSE:**", best, "\n")
 ```
 
 
-```{r echo=FALSE, fig.height=3, fig.width=5}
-autoplot(load_daily_train_ts) + 
-  autolayer(load_daily_test_ts, series = "Observed") +
-  autolayer(NN_forecast_full, series = "BSM", PI = FALSE)+ 
-  ylab("Demand")
-```
 
-
-```{r echo = TRUE}
-scores <- as.data.frame(rbind(ETS_scores, ARIMA_Fourier_scores, TBATS_scores, BSM_scores, NNETAR_scores  )
-row.names(scores) <- c("ETS", "ARIMA Fourier","TBATS", "BSM", "ETS(AAN)", "NNETAR")
-
-#choose model with lowest RMSE
-best_model_index <- which.min(soy_scores[,"RMSE"])
-cat("The best model by RMSE is:", row.names(soy_scores[best_model_index,]))       
-
-scores <- kbl(soy_scores, 
-      caption = "Forecast Accuracy for Soybean Models",
-      digits = array(5,ncol(soy_scores))) %>%
-  kable_styling(full_width = FALSE, position = "center") %>%
-  #highlight model with lowest RMSE
-  kable_styling(latex_options="striped", stripe_index = which.min(soy_scores[,"RMSE"]))
-scores
-```
-
+## 5. Discussion and next steps
+* **Model adequacy.**  Residual diagnostics show that TBATS and STL + ETS leave little autocorrelation, suggesting good fit, whereas ARIMA + Fourier presents slight remaining seasonality at lag 7.  NNETAR residuals exhibit heavier tails, indicating occasional large errors.
+* **Forecast accuracy.**  Based on RMSE the neural network model performs best on the 59‑day hold‑out, likely due to its flexibility in capturing both weekly and annual patterns.
+* **Improvements.**  Scenario generation can be improved. We limited ourselves to one temperature and one humidity variables due to computational constraints, but using more may improve the predictions. It should also be ensured that the scenarios do not generate negative numbers.

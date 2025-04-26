@@ -27,7 +27,7 @@ library(forecast)
 library(openxlsx)
 library(here)
 library(tseries)
-
+library(tidyr)
 ```
 
 ## Import and transform load data
@@ -215,19 +215,19 @@ TBATS_scores <- accuracy(TBATS_forecast$mean, load_daily_test_ts)
 
 
 #Fit on full data
-TBATS_full <- tbats(load_daily_ts)
-TBATS_forecast_full <- forecast(TBATS_full, h = n_for)
+#TBATS_full <- tbats(load_daily_ts)
+#TBATS_forecast_full <- forecast(TBATS_full, h = n_for)
 
-forecast_2011_model_5 <- as.numeric(TBATS_forecast_full$mean)
+#forecast_2011_model_5 <- as.numeric(TBATS_forecast_full$mean)
 
 #Read submission template
-template <- read_excel("data/submission_template.xlsx")
+#template <- read_excel("data/submission_template.xlsx")
 
 #Insert forecast
-template$load <- forecast_2011_model_5
+#template$load <- forecast_2011_model_5
 
 #Save as CSV
-write.csv(template, "forecasts/forecast_submission_model_5.csv", row.names = FALSE)
+#write.csv(template, "forecasts/forecast_submission_model_5.csv", row.names = FALSE)
 
 ```
 
@@ -237,7 +237,7 @@ write.csv(template, "forecasts/forecast_submission_model_5.csv", row.names = FAL
 ```{r}
 #variances for level, trend, seasonal, observation
 
-BSM_fit <- StructTS(load_daily_test_ts, type = "BSM")
+BSM_fit <- StructTS(load_daily_test_ts, type = "BSM", fixed=c(0.1,0.01,0.3,NA))
 
 checkresiduals(BSM_fit)
 
@@ -378,11 +378,218 @@ data_all <- load_daily %>%
   right_join(., humidity_daily)
 
 
-all_data_ts <- msts(log(data_all[2:ncol(as.matrix(data_all[ , -1]))]),
+all_data_ts <- msts((data_all[2:ncol(as.matrix(data_all[ , -1]))]),
                 start = c(2005, 1, 1),
                 seasonal.periods = c(7, 365.25))
-
 all_data_ts <- all_data_ts[,c("DailyLoad", "t_ws1", "rh_ws1")]
+
+n_for <- 59
+train_end  <- c(2009, 365)
+test_start <- c(2010, 1)
+test_end   <- c(2010, n_for)
+
+scen_train_ts <- window(all_data_ts, end   = train_end)
+scen_test_ts  <- window(all_data_ts, start = test_start, end = test_end)
+
+
+R = cor(scen_train_ts)
+
+horizon <- n_for
+nscen <- 10
+
+X = array(0, c(ncol(scen_train_ts), horizon, nscen))
+
+for(i in 1:ncol(scen_train_ts)){
+    k = c(2,6)
+    fit_SARIMA = auto.arima(scen_train_ts[,i],
+                          seasonal = FALSE,
+                          lambda = 0,
+                          xreg = fourier(scen_train_ts[,i],
+                          K = k))
+  
+    for_SARIMA=forecast(fit_SARIMA,
+                      xreg = fourier(scen_train_ts[,i],
+                      K = k,
+                      h = n_for),
+                      h = n_for)   #forecast using the fitted SARIMA
+  
+    for(t in 1:horizon){
+    # we will use the following expression to manually compute sd
+    sd=(for_SARIMA$upper[t,1] - for_SARIMA$lower[t,1]) / (2 * qnorm(.5 + for_SARIMA$level[1] / 200))
+    
+    # Now that I have mean and standard deviation for time t
+    # I can draw scenarios using the rnorm() function
+    X[i,t,] <- rnorm(nscen,mean=for_SARIMA$mean[t],sd=sd)  
+    
+    #note this is done in a loop for all the 24 steps we are forecasting 
+    #and this loop is inside a loop over all HPP inflows
+    
+    } # end t loop
+
+  # remove models just to make sure we start from scratch for the next HPP
+  # remember we are still inside the HPP loop
+  rm(fit_SARIMA, for_SARIMA) 
+                      
+}
+
+X
+```
+
+
+Now our array/matrix X has all the draws/scenarios but notice they don't have the same correlation we observed in the historical data.
+```{r}
+#Calculating correlation for s=1
+aux <- X[,,1]
+cor(t(aux))
+```
+
+
+Let's fix that with Cholesky.
+
+```{r}
+U <- chol(R) #that will give upper triangular matrix for Cholesky decomposition
+L <- t(U) #to get lower triangular matrix you need to transpose U, that is what the t() function is doing here
+
+#Creating array Y where we will store correlated scenarios
+Y <- array(0,c(ncol(scen_train_ts),horizon,nscen)) 
+
+# Need to use another loop structure to make sure spatial correlation among HPP is present in all scenarios
+for(s in 1:nscen){ 
+  aux <- X[,,s] #creating aux variable simple because X is not a 2x2 matrix, 
+                  #but an array of 3 dimension and we cannot do matrix multiplication with arrays
+  
+  Y[,,s] <- L%*%aux  #recall L is the Cholesky decomposition of our correlation matrix R computed from with historical data
+
+}#end scenario loop
+
+
+#Calculate correlation again
+aux <- Y[,,1]
+cor(t(aux))
+
+Y
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forecast)
+
+# years forecasting
+test_index <- time(scen_test_ts)                # msts keeps the time index
+# make sure length(test_index) == horizon
+
+scenario_df <-
+  expand_grid(
+    time      = test_index,
+    scenario  = seq_len(nscen)
+  ) %>% 
+  arrange(time, scenario) %>% 
+  mutate(
+    value = as.vector(t(Y[1, , ]))              # 1 = DailyLoad
+  )
+
+
+fan_df <-
+  scenario_df |>
+  group_by(time) |>
+  summarise(
+    p50 = median(value),
+    p10 = quantile(value, .10),
+    p90 = quantile(value, .90),
+    .groups = "drop"
+  )
+
+actual_df <- tibble(
+  time   = test_index,
+  actual = as.numeric(scen_test_ts[, "DailyLoad"])
+)
+
+
+ggplot() +
+  geom_line(data = scenario_df,
+            aes(time, value, group = scenario),
+            colour = "gray60", alpha = 0.3) +
+  geom_ribbon(data = fan_df,
+              aes(time, ymin = p10, ymax = p90),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(data = fan_df,
+            aes(time, p50),
+            colour = "steelblue", linewidth = 1) +
+  geom_line(data = actual_df,
+            aes(time, actual),
+            colour = "firebrick", linewidth = 1) +
+  geom_point(data = actual_df,
+             aes(time, actual),
+             colour = "firebrick", size = 2) +
+  labs(title    = "Daily System Load: scenarios vs actual",
+       y        = "MW",
+       subtitle = "Gray = each scenario; blue band = 10–90 % range; red = actual") +
+  theme_classic()
+
+fc <- list(
+  model  = "Simulated",
+  level  = c(10, 90),
+  mean   = ts(fan_df$p50,
+              start = start(scen_test_ts),
+              frequency = frequency(scen_test_ts)),
+  lower  = ts(cbind(fan_df$p10, fan_df$p10),
+              start = start(scen_test_ts),
+              frequency = frequency(scen_test_ts)),
+  upper  = ts(cbind(fan_df$p90, fan_df$p90),
+              start = start(scen_test_ts),
+              frequency = frequency(scen_test_ts)),
+  x      = scen_train_ts[, "DailyLoad"],
+  series = "DailyLoad",
+  method = "Cholesky-sim"
+)
+
+autoplot(fc$mean) +
+  autolayer(scen_test_ts[, "DailyLoad"], series = "Actual") +
+  labs(title = "Simulated DailyLoad forecasts vs actuals",
+       y     = "MW")
+
+accuracy(fc$mean, scen_test_ts[, "DailyLoad"])
+
+
+```
+
+
+## Perform on full data for projection
+
+
+```{r}
+
+temperature <- read_excel("data/temperature.xlsx")
+humidity <- read_excel("data/relative_humidity.xlsx")
+
+temperature_daily <- temperature %>% 
+  group_by(date) %>% 
+  summarise(across(starts_with("t_ws"),
+                   ~ mean(.x, na.rm = TRUE)))
+
+humidity_daily <- humidity %>% 
+  group_by(date) %>% 
+  summarise(across(starts_with("rh_ws"),
+                   ~ mean(.x, na.rm = TRUE)))
+
+data_all <- load_daily %>% 
+  right_join(., temperature_daily) %>% 
+  right_join(., humidity_daily)
+
+
+all_data_ts <- msts((data_all[2:ncol(as.matrix(data_all[ , -1]))]),
+                start = c(2005, 1, 1),
+                seasonal.periods = c(7, 365.25))
+all_data_ts <- all_data_ts[,c("DailyLoad", "t_ws1", "rh_ws1")]
+
+n_for <- 59
+train_end  <- c(2009, 365)
+test_start <- c(2010, 1)
+test_end   <- c(2010, n_for)
+
 
 R = cor(all_data_ts)
 
@@ -465,26 +672,76 @@ Y
 
 ```{r}
 
-#exponentiate back
-for(s in 1:nscen){
-  Y[,,s] <- exp(Y[,,s])
-}
 
-Y[1,,]
 
-#getting min and max values of Y to make sure all scenarios will be within the plot limits 
-ymax <- 20 # max(Y[1,,])
-ymin <- 0 #min(Y[1,,])
-plot(Y[1,,1],col="gray",type="l",ylim=c(ymin,ymax),xaxt='n',xlab="") #plotting first scenario
-axis(1,at=c(1,13),labels=c("2011","2012"))
-for(s in 2:nscen){
-  lines(Y[1,,s],col="gray")   #adding lines to the plot corresponding to all scenarios
-} 
+horizon      <- n_for  # 59
+last_train   <- as.Date("2009-12-31")  # end of training sample
+test_index   <- seq(last_train + 1,
+                    by   = "day",
+                    len  = horizon)
+scenario_df <-
+  expand_grid(
+    time     = test_index,
+    scenario = seq_len(nscen)
+  ) %>%
+  arrange(time, scenario) %>%
+  mutate(
+    value = as.vector(t(Y[1, , ]))  # length = horizon × nscen = 590
+  )
+
+fan_df <-
+  scenario_df %>%
+  group_by(time) %>%
+  summarise(
+    p50 = median(value),
+    p10 = quantile(value, .10),
+    p90 = quantile(value, .90),
+    .groups = "drop"
+  )
+
+actual_df <- tibble(
+  time   = test_index,
+  actual = window(all_data_ts[,"DailyLoad"],
+                  start = c(2010,1), end = c(2010,n_for)) |> as.numeric()
+)
 
 
 ```
 
 
+```{r}
+ggplot() +
+  geom_line(data = scenario_df,
+            aes(time, value, group = interaction(scenario)),
+            colour = "gray60", alpha = 0.3) +
+  geom_ribbon(data = fan_df,
+              aes(time, ymin = p10, ymax = p90),
+              fill = "steelblue", alpha = 0.25) +
+  geom_line(data = fan_df, aes(time, p50),
+            colour = "steelblue", linewidth = 1) +
+  geom_line(data = actual_df, aes(time, actual),
+            colour = "firebrick", linewidth = 1) +
+  labs(title    = "Daily-load scenarios vs actual (Jan–Feb 2010)",
+       subtitle = "Gray = each scenario; blue band = 10–90 % fan; red = actual",
+       y = "MW") +
+  theme_classic()
+
+```
+
+```{r}
+accuracy(fan_df$p50, actual_df$actual)
+```
 
 
+```{r}
+forecast_2011_model_8 <- as.numeric(NN_forecast_full$mean)
+#Read submission template
+template <- read_excel("data/submission_template.xlsx")
+
+#Insert forecast
+template$load <- fan_df$p50
+
+#Save as CSV
+write.csv(template, "forecasts/forecast_submission_model_9.csv", row.names = FALSE)
+```
 
